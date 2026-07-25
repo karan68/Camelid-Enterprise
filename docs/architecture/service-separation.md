@@ -36,7 +36,7 @@ terminal, Kanban agents) are **not in this repository**.
 ### 2.1 Repository layout (present)
 
 ```
-Cargo.toml                     workspace: 6 member crates
+Cargo.toml                     workspace: 8 member crates
 crates/
   engine-core/                 platform-neutral engine (gguf, model, tensor,
                                forward, tokenizer, host, error)
@@ -45,12 +45,19 @@ crates/
   engine-windows/              per-platform kernels + host probe()
   gateway/                     transparent fixed-origin HTTP gateway
   identity/                    token -> opaque principal id primitive (SQLite)
+  replica-contract/            dependency-free public route registry
   server/                      the `camelid-enterprise` serving binary
 deploy/
   docker/                      separate replica and gateway images
   k8s/deployment.yaml          one deterministic replica pool, one model
   k8s/service.yaml             ClusterIP service in front of the pool
   k8s/gateway-*.yaml           private gateway Deployment + Service
+  k8s/replica-network-policy   ingress policy: replica port reachable only
+    .yaml                      from gateway-labelled pods
+  macos/                       launchd units for bare-metal Apple Silicon
+docs/
+  adr/                         architecture decision records
+  contracts/                   versioned client-facing HTTP contracts
 ```
 
 ### 2.2 Components that exist Today
@@ -59,13 +66,15 @@ deploy/
 |---|---|---|
 | **Serving replica** | `crates/server` (`camelid-enterprise` bin) | CLI (`serve`), binds an HTTP listener, applies the deterministic lane, stamps attribution, loads one model at startup. |
 | **Lane / config freeze** | `crates/server/src/lane.rs` | Applies a canonical env-var configuration vector, fails closed on any override, publishes its SHA-256. Engine pinned by revision (`ENGINE_PIN`). |
-| **Attribution middleware** | `crates/server/src/attribution.rs` | Stamps `x-camelid-lane` / `x-camelid-config-sha256` / `x-camelid-host` on every response, injects fields into completion bodies, writes optional JSONL serving receipts (each carrying the gateway-stamped `request_id` when present, or `null` for direct-to-replica traffic). |
-| **Transparent gateway** | `crates/gateway` (`camelid-enterprise-gateway` bin) | Fixed-origin forwarding for the `/v1` inference allowlist it derives from `replica_contract::PUBLIC_ROUTES` (so the allowlist cannot silently drift from the replica's public contract), with opaque streaming bodies, hop-by-hop header filtering, no retries, bounded concurrency (admission-controlled), and no response rewriting. Replica control routes are not exposed. Optionally enforces bearer-token auth (see below), checked before the admission permit is taken; unauthenticated pass-through remains the default. Stamps a gateway-authoritative `x-camelid-request-id` on every forwarded request (overwriting any client value) and, with `serve --audit-log <path>`, writes one JSONL audit line per handled request — including auth/admission rejections — as `{ts, request_id, principal, organization, method, path, status}`. Principal and organization remain gateway-local; only the opaque request id reaches a replica. |
-| **OpenAI-compatible API** | **external** `camelid::api` (git dep, pinned rev `b4e3a905…`) | The gateway exposes `/v1/health`, model discovery, completions/chat, and the pinned engine's compatibility endpoints. Replica-local `/api` model management remains private. Provided by the pinned engine crate, **not** by this repo. |
+| **Attribution middleware** | `crates/server/src/attribution.rs` | Stamps six headers on every response — `x-camelid-lane`, `-config-sha256`, `-admission-sha256`, `-model-sha256`, `-host`, `-worker-threads` — injects the same facts into completion bodies, and writes optional JSONL serving receipts with the digests at full length, each carrying the gateway-stamped `request_id` when present (`null` for direct-to-replica traffic). |
+| **Public route contract** | `crates/replica-contract`, `crates/server/src/contract.rs`, `docs/contracts/replica-http-v1.md` | The client-facing route set as a dependency-free registry, so replicas and gateways share one inventory without linking the engine — the replica's route filter and the gateway's forwarding table are both built from it. The private pinned-route inventory and its executable conformance stay in the server crate and drive the exact pinned router. |
+| **Served-surface filter** | `crates/server/src/surface.rs` | Refuses anything outside the contract's routes with `403 route_not_served`, deferring to `replica_contract::PUBLIC_ROUTES` rather than declaring a second inventory; and, on the two generation routes, refuses a `model` field naming weights this replica did not hash with `404 model_not_served`. The second check is separate because it has to be: the engine resolves that field against the filesystem, over a route the contract requires and the gateway forwards. |
+| **Transparent gateway** | `crates/gateway` (`camelid-enterprise-gateway` bin) | Fixed-origin forwarding for the routes of `replica_contract::PUBLIC_ROUTES` — the same registry the replica's filter reads, linked rather than mirrored, so the two cannot disagree — with opaque streaming bodies, hop-by-hop header filtering, no retries, bounded concurrency (admission-controlled), and no response rewriting. Replica control routes are not exposed. Returns a typed `502` when it cannot reach the upstream. Optionally enforces bearer-token auth (see below), checked before the admission permit is taken; unauthenticated pass-through remains the default. Stamps a gateway-authoritative `x-camelid-request-id` on every forwarded request (overwriting any client value) and, with `serve --audit-log <path>`, writes one JSONL audit line per handled request — including auth/admission rejections — as `{ts, request_id, principal, organization, method, path, status}`. Principal and organization remain gateway-local; only the opaque request id reaches a replica. Optionally enforces a per-organization fixed-window request quota, and with `serve --usage-log <path>` writes a separate terminal transport record per authenticated, quota-admitted request. |
+| **OpenAI-compatible API** | **external** `camelid::api` (git dep, pinned rev `b4e3a905…`) | `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/v1/health`, the engine's typed compatibility replies, and its own control plane (`/api/models/load` and the rest). Provided by the pinned engine crate, **not** by this repo; the replica serves the contract's routes over it and refuses everything else, the control plane included. |
 | **Engine core** | `crates/engine-core` | GGUF container, model config, tensor/forward/tokenizer types. Host-agnostic. |
 | **Platform kernels** | `crates/engine-{macos,linux,windows}` | Runtime CPU feature detection (`probe()`), platform kernels. macOS port landing first; Linux/Windows currently capability-detection only. |
-| **Identity primitive** | `crates/identity` | Resolves an opaque bearer token to a principal plus explicitly token-scoped organization, backed by a local SQLite store (hashed tokens only). Operators can create/list organizations, add/remove memberships, and issue an organization-scoped token; removing a membership revokes its scoped tokens. Wired into the gateway as opt-in enforcement; still no RBAC or SSO. |
-| **Deployment assets** | `deploy/` | Dockerfile (model mounted at runtime, not baked); K8s Deployment (Guaranteed QoS, one model per pool, startup/readiness probes on `/v1/models`) + Service. |
+| **Identity primitive** | `crates/identity` | Resolves an opaque bearer token to a principal plus explicitly token-scoped organization, backed by a local SQLite store (hashed tokens only). Operators can create/list organizations, add/remove memberships, and issue an organization-scoped token; removing a membership revokes its scoped tokens. Wired into the gateway (see below) as opt-in enforcement; still no RBAC or SSO. |
+| **Deployment assets** | `deploy/` | Dockerfile (model mounted at runtime, not baked); K8s Deployment (Guaranteed QoS, one model per pool, explicit `--threads`, startup/readiness probes on `/v1/health` for `generation_ready`) + Service + a replica ingress NetworkPolicy admitting port 8181 only from gateway-labelled pods; launchd units for bare-metal Apple Silicon. |
 
 ### 2.3 Properties that exist Today
 
@@ -76,13 +85,23 @@ deploy/
   `deterministic`.
 - **Stateless replica.** No persistence beyond the optional append-only receipt
   log. No database.
-- **No identity layer.** No authentication, no authorization, no users, no
-  tenants, no API keys. The `--addr 0.0.0.0` warning in the README is the only
-  access-control guidance; security is entirely "put it on a trusted network."
+- **Identity at the gateway only, and opt-in.** The replica has no
+  authentication, no authorization, no users, no tenants and no API keys — by
+  design, since identity lives above it. The gateway can enforce bearer tokens
+  (`serve --identity-db <path>`), but enforcement is off by default and there
+  are still no orgs, roles, sessions or quotas.
+- **The replica is an internal service, and the deployment is its boundary.**
+  Clients enter through the gateway; `deploy/k8s/replica-network-policy.yaml`
+  admits replica port 8181 only from gateway-labelled pods, and on one box the
+  replica stays on loopback. The replica's own served-route contract and
+  generation-body model check are defence in depth behind that boundary, not a
+  replacement for it: they bound *what* an admitted caller may ask for, never
+  *who* may ask.
 - **Transparent gateway only.** A fixed-origin gateway fronts one replica or one
-  K8s `Service`. There is no per-user or per-model routing, authentication,
-  quota, or rate limiting. It rejects non-inference paths and bounds concurrent
-  request streams.
+  K8s `Service`. There is no per-user or per-model routing, quota, or rate
+  limiting; authentication exists but is opt-in. It rejects non-contractual
+  paths, bounds concurrent request streams, and stamps a correlation id it
+  records in its own audit log.
 
 ---
 
@@ -206,7 +225,11 @@ tokens for one model"; everything multi-user is layered on top.
 1. **Baseline & contracts — implemented.**
   `camelid-enterprise-replica-http-v1` separates the contractual `/v1` surface
   from the pinned engine's private implementation inventory. Its registry is
-  dependency-free so replicas and gateways can share it, and is checked against
+  dependency-free so replicas and gateways can share it, and both now do: the
+  replica's served-route filter and the gateway's forwarding table are each built
+  from `replica_contract::PUBLIC_ROUTES` instead of declaring a second inventory,
+  so nothing is left that can drift out of agreement with the published contract.
+  The registry is checked against
   the exact pinned router without invoking handlers; no-model tests cover
   health, discovery, typed errors, and attribution. An explicit
   model-backed test covers load, readiness, deterministic greedy output, and
