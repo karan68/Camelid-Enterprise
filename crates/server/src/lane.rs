@@ -29,7 +29,13 @@ use std::collections::BTreeSet;
 use std::ffi::OsString;
 
 /// Exact engine dependency revision, derived from `Cargo.toml` by `build.rs`.
-pub const ENGINE_PIN: &str = env!("CAMELID_ENGINE_PIN");
+///
+/// The build-time variable is outside the `CAMELID_` namespace on purpose: Cargo
+/// puts a build script's `rustc-env` names into the environment of the binaries
+/// it runs, so a `CAMELID_`-prefixed one would be a variable the scan below
+/// refuses, present under every `cargo run` and `cargo test` and unsettable from
+/// the shell. See `build.rs`.
+pub const ENGINE_PIN: &str = env!("ENTERPRISE_ENGINE_PIN");
 
 /// Namespace the engine and this distribution both draw their keys from. The
 /// scan claims the whole prefix: everything under it is refused unless
